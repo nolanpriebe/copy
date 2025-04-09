@@ -1,0 +1,928 @@
+#!/usr/bin/env python3
+"""
+copy - A tool to copy code and file contents to clipboard optimized for sharing with LLMs
+"""
+
+import os
+import sys
+import argparse
+import subprocess
+import fnmatch
+from pathlib import Path
+import mimetypes
+import json
+import re
+import datetime
+import shutil
+from collections import defaultdict
+
+def read_ignore_patterns(ignore_file):
+    """Read ignore patterns from file"""
+    if not os.path.exists(ignore_file):
+        return []
+    
+    with open(ignore_file, 'r') as f:
+        return [line.strip() for line in f if line.strip() and not line.startswith('#')]
+
+def should_ignore(path, ignore_patterns, is_dir=False):
+    """Check if path should be ignored based on patterns"""
+    # Convert path to relative format for matching
+    rel_path = path
+    if not isinstance(path, str):
+        rel_path = str(path)
+    
+    # Special case for .git directory (always ignore)
+    if is_dir and (rel_path == '.git' or rel_path.endswith('/.git') or '/.git/' in rel_path):
+        return True
+    
+    # Ensure consistent path format - end directories with /
+    if is_dir and not rel_path.endswith('/'):
+        dir_path = rel_path + '/'
+    else:
+        dir_path = rel_path
+    
+    # Check each ignore pattern
+    for pattern in ignore_patterns:
+        # If pattern ends with /, it's a directory pattern
+        if pattern.endswith('/'):
+            # Special handling for root level directories
+            if pattern.startswith('./'):
+                clean_pattern = pattern[2:]  # Remove ./ from pattern
+            else:
+                clean_pattern = pattern
+                
+            # Check if dir_path matches the pattern
+            if fnmatch.fnmatch(dir_path, clean_pattern):
+                return True
+            # Check if dir_path is a subdirectory of the pattern
+            if is_dir and ('/' + clean_pattern) in ('/' + dir_path):
+                return True
+        else:
+            # Regular file pattern matching
+            if fnmatch.fnmatch(rel_path, pattern):
+                return True
+    
+    return False
+
+def is_binary_file(file_path):
+    """Check if a file is binary"""
+    mime_type, _ = mimetypes.guess_type(file_path)
+    
+    # If we can guess the MIME type and it's text, it's not binary
+    if mime_type and mime_type.startswith('text/'):
+        return False
+    
+    # Check file extension against common text extensions
+    text_extensions = {'.txt', '.md', '.py', '.js', '.jsx', '.ts', '.tsx', '.html', 
+                      '.css', '.scss', '.less', '.json', '.xml', '.yaml', '.yml',
+                      '.c', '.cpp', '.h', '.hpp', '.cs', '.java', '.kt', '.rs',
+                      '.go', '.rb', '.php', '.sh', '.bash', '.zsh', '.conf', '.cfg',
+                      '.ini', '.properties', '.gradle', '.sql', '.graphql', '.gitignore'}
+    
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext in text_extensions:
+        return False
+    
+    # Check the first chunk of the file for null bytes (common in binary files)
+    try:
+        with open(file_path, 'rb') as f:
+            chunk = f.read(1024)
+            if b'\x00' in chunk:
+                return True
+            
+            # Try to decode as text
+            try:
+                chunk.decode('utf-8')
+                return False
+            except UnicodeDecodeError:
+                return True
+    except IOError:
+        # If we can't read the file, assume it's binary to be safe
+        return True
+
+def list_files_recursive(directory, ignore_patterns, file_filter=None, max_depth=None):
+    """List all files recursively, respecting ignore patterns"""
+    file_list = []
+    
+    # Make sure .git is in ignore patterns (force it)
+    git_patterns = [p for p in ignore_patterns if p == '.git/' or p == '.git']
+    if not git_patterns:
+        ignore_patterns = ignore_patterns + ['.git/']
+    
+    for root, dirs, files in os.walk(directory):
+        # Get relative path of current directory
+        rel_root = os.path.relpath(root, directory)
+        
+        # Check if current directory should be ignored
+        if rel_root != '.' and should_ignore(rel_root, ignore_patterns, is_dir=True):
+            dirs.clear()  # Skip all subdirectories
+            continue      # Skip all files in this directory
+        
+        # Check depth if max_depth is specified
+        if max_depth is not None:
+            depth = 0 if rel_root == '.' else rel_root.count(os.sep) + 1
+            if depth >= max_depth:
+                dirs.clear()  # Don't go deeper
+                
+        # Normalize rel_root for file path construction
+        if rel_root == '.':
+            rel_root = ''
+        
+        # Filter out ignored directories before traversing
+        i = 0
+        while i < len(dirs):
+            rel_dir_path = os.path.join(rel_root, dirs[i]) if rel_root else dirs[i]
+            if should_ignore(rel_dir_path, ignore_patterns, is_dir=True):
+                dirs.pop(i)
+            else:
+                i += 1
+        
+        # Add non-ignored files
+        for file in files:
+            file_path = os.path.join(root, file)
+            rel_path = os.path.join(rel_root, file) if rel_root else file
+            
+            if not should_ignore(rel_path, ignore_patterns):
+                # Apply additional file filter if specified
+                if file_filter and not file_filter(file_path):
+                    continue
+                    
+                file_list.append(file_path)
+    
+    return file_list
+
+def list_files_flat(directory, ignore_patterns, file_filter=None):
+    """List files in current directory only (not recursive)"""
+    file_list = []
+    
+    # List files in the current directory
+    for item in os.listdir(directory):
+        full_path = os.path.join(directory, item)
+        
+        # Skip directories and ignored files
+        if os.path.isdir(full_path):
+            if should_ignore(item, ignore_patterns, is_dir=True):
+                continue
+        elif not should_ignore(item, ignore_patterns) and os.path.isfile(full_path):
+            # Apply additional file filter if specified
+            if file_filter and not file_filter(full_path):
+                continue
+                
+            file_list.append(full_path)
+    
+    return file_list
+
+def get_file_extension(file_path):
+    """Get file extension without the dot"""
+    return os.path.splitext(file_path)[1].lower().lstrip('.')
+
+def get_language_from_extension(ext):
+    """Convert file extension to markdown language tag"""
+    extension_map = {
+        'py': 'python',
+        'js': 'javascript',
+        'jsx': 'jsx',
+        'ts': 'typescript',
+        'tsx': 'tsx',
+        'html': 'html',
+        'css': 'css',
+        'scss': 'scss',
+        'less': 'less',
+        'json': 'json',
+        'xml': 'xml',
+        'yaml': 'yaml',
+        'yml': 'yaml',
+        'md': 'markdown',
+        'c': 'c',
+        'cpp': 'cpp',
+        'h': 'c',
+        'hpp': 'cpp',
+        'cs': 'csharp',
+        'java': 'java',
+        'kt': 'kotlin',
+        'rs': 'rust',
+        'go': 'go',
+        'rb': 'ruby',
+        'php': 'php',
+        'sh': 'bash',
+        'bash': 'bash',
+        'zsh': 'bash',
+        'sql': 'sql',
+        'graphql': 'graphql',
+        'txt': '',
+        'conf': '',
+        'cfg': '',
+        'ini': 'ini',
+    }
+    return extension_map.get(ext, '')
+
+def estimate_tokens(text):
+    """Rough estimate of tokens in text (for LLM context windows)"""
+    # Very simple estimate: ~4 characters per token
+    return len(text) // 4
+
+def get_file_contents(file_paths, max_size_mb=10, format_type=None, include_line_numbers=False, compress_whitespace=False):
+    """Get contents of files, skipping binary files"""
+    max_size = max_size_mb * 1024 * 1024  # Convert to bytes
+    contents = []
+    skipped_files = []
+    binary_files = []
+    total_tokens = 0
+    total_chars = 0
+    
+    for file_path in file_paths:
+        # Skip files that are too large
+        if os.path.getsize(file_path) > max_size:
+            skipped_files.append(file_path)
+            continue
+        
+        # Skip binary files
+        if is_binary_file(file_path):
+            binary_files.append(file_path)
+            continue
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                file_content = f.read()
+                
+                if compress_whitespace:
+                    # Compress multiple blank lines into a single blank line
+                    file_content = re.sub(r'\n\s*\n\s*\n+', '\n\n', file_content)
+                
+                # Get relative path for display
+                rel_path = os.path.relpath(file_path)
+                
+                # Get file extension and language for markdown formatting
+                ext = get_file_extension(file_path)
+                lang = get_language_from_extension(ext)
+                
+                # Format the content based on the format type
+                if format_type == 'markdown':
+                    if include_line_numbers:
+                        # Add line numbers
+                        lines = file_content.split('\n')
+                        width = len(str(len(lines)))
+                        numbered_content = '\n'.join(f"{i+1:{width}} | {line}" for i, line in enumerate(lines))
+                        content_block = f"## {rel_path}\n\n```{lang}\n{numbered_content}\n```\n\n"
+                    else:
+                        content_block = f"## {rel_path}\n\n```{lang}\n{file_content}\n```\n\n"
+                elif format_type == 'json':
+                    # We'll collect all file contents and return as JSON later
+                    continue
+                else:
+                    # Plain text format
+                    separator = "-" * 30
+                    if include_line_numbers:
+                        lines = file_content.split('\n')
+                        width = len(str(len(lines)))
+                        numbered_content = '\n'.join(f"{i+1:{width}} | {line}" for i, line in enumerate(lines))
+                        content_block = f"{separator}\n{rel_path}\n{separator}\n{numbered_content}\n\n"
+                    else:
+                        content_block = f"{separator}\n{rel_path}\n{separator}\n{file_content}\n\n"
+                
+                contents.append(content_block)
+                
+                # Update token and character counts
+                total_chars += len(content_block)
+                total_tokens += estimate_tokens(content_block)
+                
+        except (IOError, UnicodeDecodeError) as e:
+            binary_files.append(file_path)
+    
+    # If JSON format is requested, handle it differently
+    if format_type == 'json':
+        file_data = []
+        for file_path in file_paths:
+            if file_path not in skipped_files and file_path not in binary_files:
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        file_content = f.read()
+                        if compress_whitespace:
+                            file_content = re.sub(r'\n\s*\n\s*\n+', '\n\n', file_content)
+                        file_data.append({
+                            'path': os.path.relpath(file_path),
+                            'content': file_content,
+                            'size': os.path.getsize(file_path),
+                            'extension': get_file_extension(file_path)
+                        })
+                except (IOError, UnicodeDecodeError):
+                    pass
+        
+        json_content = json.dumps({'files': file_data}, indent=2)
+        contents = [json_content]
+        total_chars = len(json_content)
+        total_tokens = estimate_tokens(json_content)
+    
+    return {
+        'contents': '\n'.join(contents),
+        'skipped': skipped_files,
+        'binary': binary_files,
+        'total_chars': total_chars,
+        'total_tokens': total_tokens
+    }
+
+def generate_directory_tree(directory, ignore_patterns, max_depth=None):
+    """Generate a pretty directory tree using ASCII characters"""
+    tree_lines = [f"Directory structure for: {os.path.abspath(directory)}", ""]
+    
+    # Track which levels have more items coming
+    dirs_path_map = {}
+    
+    # First, collect all valid directories
+    for root, dirs, _ in os.walk(directory):
+        rel_root = os.path.relpath(root, directory)
+        if rel_root == '.':
+            rel_root = ''
+            
+        # Check depth
+        depth = 0 if rel_root == '' else rel_root.count(os.sep) + 1
+        if max_depth is not None and depth > max_depth:
+            dirs.clear()
+            continue
+            
+        # Apply ignore patterns
+        i = 0
+        while i < len(dirs):
+            rel_dir_path = os.path.join(rel_root, dirs[i]) if rel_root else dirs[i]
+            if should_ignore(rel_dir_path, ignore_patterns, is_dir=True):
+                dirs.pop(i)
+            else:
+                # Add to our mapping
+                full_path = os.path.join(root, dirs[i])
+                dirs_path_map[full_path] = True
+                i += 1
+    
+    # Now collect all files
+    all_entries = []
+    
+    for root, dirs, files in os.walk(directory):
+        # Check depth
+        rel_root = os.path.relpath(root, directory)
+        if rel_root == '.':
+            rel_root = ''
+            
+        depth = 0 if rel_root == '' else rel_root.count(os.sep) + 1
+        if max_depth is not None and depth > max_depth:
+            continue
+        
+        # Skip ignored directories
+        if rel_root and should_ignore(rel_root, ignore_patterns, is_dir=True):
+            continue
+            
+        # Add directories first
+        for d in sorted(dirs):
+            dir_path = os.path.join(root, d)
+            rel_dir_path = os.path.join(rel_root, d) if rel_root else d
+            
+            if not should_ignore(rel_dir_path, ignore_patterns, is_dir=True):
+                all_entries.append((rel_dir_path, True))  # True = is directory
+        
+        # Then add files
+        for f in sorted(files):
+            file_path = os.path.join(root, f)
+            rel_file_path = os.path.join(rel_root, f) if rel_root else f
+            
+            if not should_ignore(rel_file_path, ignore_patterns):
+                all_entries.append((rel_file_path, False))  # False = is file
+    
+    # Sort entries to ensure proper order
+    all_entries.sort()
+    
+    # Now build the tree with ASCII characters
+    for entry, is_dir in all_entries:
+        parts = entry.split(os.sep)
+        depth = len(parts) - 1
+        
+        if depth < 0 or (max_depth is not None and depth > max_depth):
+            continue
+            
+        # Build prefix based on depth
+        prefix = ""
+        for i in range(depth):
+            prefix += "|   "
+        
+        # Add the appropriate connector
+        if depth > 0:
+            prefix = prefix[:-4] + "+-- "
+            
+        # Add the entry
+        tree_lines.append(f"{prefix}{parts[-1]}{os.sep if is_dir else ''}")
+    
+    return '\n'.join(tree_lines)
+
+def get_project_summary(directory, ignore_patterns):
+    """Generate a project summary including file counts, types, etc."""
+    summary_lines = [f"# Project Summary for: {os.path.abspath(directory)}", ""]
+    
+    # Collect stats
+    file_count = 0
+    dir_count = 0
+    extension_counts = defaultdict(int)
+    total_size = 0
+    largest_files = []
+    newest_files = []
+    
+    all_files = list_files_recursive(directory, ignore_patterns)
+    
+    for file_path in all_files:
+        file_count += 1
+        file_size = os.path.getsize(file_path)
+        total_size += file_size
+        ext = get_file_extension(file_path) or 'no_extension'
+        extension_counts[ext] += 1
+        
+        # Track largest files
+        largest_files.append((file_path, file_size))
+        
+        # Track newest files
+        mtime = os.path.getmtime(file_path)
+        newest_files.append((file_path, mtime))
+    
+    # Count directories
+    for root, dirs, _ in os.walk(directory):
+        i = 0
+        while i < len(dirs):
+            rel_dir_path = os.path.relpath(os.path.join(root, dirs[i]), directory)
+            if should_ignore(rel_dir_path, ignore_patterns, is_dir=True):
+                dirs.pop(i)
+            else:
+                dir_count += 1
+                i += 1
+    
+    # Sort and prepare the data
+    largest_files.sort(key=lambda x: x[1], reverse=True)
+    newest_files.sort(key=lambda x: x[1], reverse=True)
+    
+    # Convert total size to human readable
+    def human_size(size_bytes):
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size_bytes < 1024 or unit == 'GB':
+                return f"{size_bytes:.2f} {unit}"
+            size_bytes /= 1024
+    
+    # Build summary
+    summary_lines.append(f"## Overview")
+    summary_lines.append(f"- Total files: {file_count}")
+    summary_lines.append(f"- Total directories: {dir_count}")
+    summary_lines.append(f"- Total size: {human_size(total_size)}")
+    summary_lines.append("")
+    
+    # File types
+    summary_lines.append(f"## File Types")
+    for ext, count in sorted(extension_counts.items(), key=lambda x: x[1], reverse=True):
+        summary_lines.append(f"- .{ext}: {count} files")
+    summary_lines.append("")
+    
+    # Largest files
+    summary_lines.append(f"## Largest Files")
+    for file_path, size in largest_files[:5]:
+        rel_path = os.path.relpath(file_path, directory)
+        summary_lines.append(f"- {rel_path}: {human_size(size)}")
+    summary_lines.append("")
+    
+    # Newest files
+    summary_lines.append(f"## Most Recently Modified")
+    for file_path, mtime in newest_files[:5]:
+        rel_path = os.path.relpath(file_path, directory)
+        mod_time = datetime.datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')
+        summary_lines.append(f"- {rel_path}: {mod_time}")
+    
+    return '\n'.join(summary_lines)
+
+def detect_important_files(directory):
+    """Detect important files like README, main entry points, etc."""
+    important_files = []
+    patterns = [
+        "README*",
+        "LICENSE*",
+        "package.json",
+        "requirements.txt",
+        "go.mod",
+        "Cargo.toml",
+        "Gemfile",
+        "build.gradle",
+        "pom.xml",
+        "docker-compose.yml",
+        "Dockerfile",
+        "main.*",
+        "index.*",
+        "app.*"
+    ]
+    
+    for pattern in patterns:
+        for root, _, files in os.walk(directory):
+            for file in fnmatch.filter(files, pattern):
+                important_files.append(os.path.join(root, file))
+    
+    return important_files
+
+def get_git_info(directory):
+    """Get git information for the repository"""
+    git_info = []
+    
+    try:
+        # Check if it's a git repository
+        result = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=directory,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        
+        if result.returncode != 0:
+            return "Not a git repository"
+        
+        # Get current branch
+        branch = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=directory,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        ).stdout.strip()
+        
+        git_info.append(f"Current branch: {branch}")
+        
+        # Get latest commit
+        commit = subprocess.run(
+            ["git", "log", "-1", "--oneline"],
+            cwd=directory,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        ).stdout.strip()
+        
+        git_info.append(f"Latest commit: {commit}")
+        
+        # Get status summary
+        status = subprocess.run(
+            ["git", "status", "-s"],
+            cwd=directory,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        ).stdout.strip()
+        
+        if status:
+            git_info.append("Modified files:")
+            for line in status.split('\n'):
+                git_info.append(f"  {line}")
+        else:
+            git_info.append("Working directory clean")
+        
+        return '\n'.join(git_info)
+    
+    except Exception as e:
+        return f"Error getting git info: {e}"
+
+def copy_to_clipboard(text):
+    """Copy text to clipboard using clip.exe (WSL)"""
+    try:
+        process = subprocess.Popen(['clip.exe'], stdin=subprocess.PIPE)
+        process.communicate(input=text.encode('utf-8'))
+        return True
+    except Exception as e:
+        print(f"Error copying to clipboard: {e}")
+        return False
+
+def create_default_ignore_file(ignore_file):
+    """Create a default ignore file with common patterns for code projects"""
+    default_ignores = [
+        "# Git files",
+        ".git/",
+        ".gitignore",
+        ".gitattributes",
+        ".gitmodules",
+        ".copyignore",
+        "",
+        "# Compiled files",
+        "*.exe",
+        "*.dll",
+        "*.so",
+        "*.dylib",
+        "*.o",
+        "*.obj",
+        "*.class",
+        "*.jar",
+        "*.a",
+        "*.lib",
+        "",
+        "# Go files",
+        "go.mod",
+        "go.sum",
+        "vendor/",
+        "bin/",
+        "",
+        "# Rust",
+        "target/",
+        "Cargo.lock",
+        "",
+        "# Node.js",
+        "node_modules/",
+        "package-lock.json",
+        "yarn.lock",
+        "npm-debug.log*",
+        "yarn-debug.log*",
+        "yarn-error.log*",
+        "",
+        "# Python",
+        "__pycache__/",
+        "*.py[cod]",
+        "*$py.class",
+        ".Python",
+        "env/",
+        "build/",
+        "develop-eggs/",
+        "dist/",
+        "downloads/",
+        "eggs/",
+        ".eggs/",
+        "lib/",
+        "lib64/",
+        "parts/",
+        "sdist/",
+        "var/",
+        "*.egg-info/",
+        ".installed.cfg",
+        "*.egg",
+        "venv/",
+        ".venv/",
+        "pip-log.txt",
+        "",
+        "# IDE files",
+        ".idea/",
+        ".vscode/",
+        "*.sublime-*",
+        ".vs/",
+        "*.swp",
+        "*.swo",
+        "",
+        "# Java/Maven/Gradle",
+        "*.iml",
+        ".gradle/",
+        "build/",
+        "out/",
+        "target/",
+        "",
+        "# C#/.NET",
+        "bin/",
+        "obj/",
+        "*.suo",
+        "*.user",
+        "",
+        "# Logs and databases",
+        "*.log",
+        "*.sql",
+        "*.sqlite",
+        "*.db",
+        "",
+        "# OS generated files",
+        ".DS_Store",
+        ".DS_Store?",
+        "._*",
+        ".Spotlight-V100",
+        ".Trashes",
+        "ehthumbs.db",
+        "Thumbs.db",
+        "",
+        "# Temporary files",
+        "tmp/",
+        "temp/",
+        "*~",
+        "*.bak",
+        "*.tmp",
+        "",
+        "# Docker",
+        "*.env",
+        ".dockerignore",
+        "",
+        "# Build artifacts",
+        "coverage/",
+        ".coverage",
+        "htmlcov/",
+        "",
+        "# Common large/binary file types",
+        "*.zip",
+        "*.tar.gz",
+        "*.tgz",
+        "*.rar",
+        "*.7z",
+        "*.iso",
+        "*.pdf",
+        "*.jpg",
+        "*.jpeg",
+        "*.png",
+        "*.gif",
+        "*.svg",
+        "*.ttf",
+        "*.woff",
+        "*.woff2",
+        "*.eot",
+        "*.mp3",
+        "*.mp4",
+        "*.avi",
+        "*.mov",
+        "*.webm",
+        "*.webp",
+        "*.wav",
+        "*.mkv",
+        "*.flv",
+    ]
+    
+    with open(ignore_file, 'w') as f:
+        f.write('\n'.join(default_ignores))
+
+def print_setup_help():
+    """Print help about setting up the script in PATH"""
+    print("\nTo add this script to your PATH:")
+    print("1. Save this script as 'copy' in a directory like ~/bin")
+    print("2. Make it executable: chmod +x ~/bin/copy")
+    print("3. Add the directory to your PATH if not already there:")
+    print("   - Edit your shell config file (~/.bashrc, ~/.zshrc, etc.)")
+    print("   - Add this line: export PATH=\"$HOME/bin:$PATH\"")
+    print("   - Reload your config: source ~/.bashrc (or your config file)")
+    print("\nYour current PATH directories are:")
+    for path in os.environ.get('PATH', '').split(':'):
+        print(f"  - {path}")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Copy code and file contents to clipboard optimized for sharing with LLMs",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  copy                        # Copy contents of all files (except ignored) from current directory
+  copy --paths-only           # Copy only file paths instead of contents
+  copy --flat                 # Copy only files in the current directory (non-recursive)
+  copy --format markdown      # Format output as markdown with code blocks
+  copy --tree                 # Copy directory structure tree view
+  copy --summary              # Copy project summary (stats, file types, etc.)
+  copy --important            # Copy only important files like README, main entry points
+  copy --git-info             # Include git repository information
+  copy --max-depth 2          # Limit directory traversal depth
+  copy --filter "*.py,*.js"   # Only include Python and JavaScript files
+  copy --exclude "test_*"     # Exclude files matching pattern
+  copy -d /path/to/project    # Copy files from a specific directory
+  copy --create-ignore        # Create a default .copyignore file
+  copy -i custom.ignore       # Use a custom ignore file
+  copy --line-numbers         # Include line numbers in source code
+  copy --setup-help           # Show PATH setup instructions
+        """
+    )
+    parser.add_argument('-i', '--ignore-file', default='.copyignore',
+                        help="Path to ignore file (default: .copyignore)")
+    parser.add_argument('--create-ignore', action='store_true',
+                        help="Create a default ignore file")
+    parser.add_argument('-d', '--directory', default='.',
+                        help="Directory to copy files from (default: current directory)")
+    parser.add_argument('--setup-help', action='store_true',
+                        help="Show help for setting up this script in PATH")
+    parser.add_argument('--paths-only', action='store_true',
+                        help="Copy only file paths instead of file contents")
+    parser.add_argument('--flat', action='store_true',
+                        help="Copy only files in the current directory (non-recursive)")
+    parser.add_argument('--max-size', type=int, default=10,
+                        help="Maximum file size in MB to copy (default: 10)")
+    parser.add_argument('--format', choices=['plain', 'markdown', 'json'], default='plain',
+                        help="Output format (default: plain)")
+    parser.add_argument('--tree', action='store_true',
+                        help="Copy directory structure tree view")
+    parser.add_argument('--max-depth', type=int,
+                        help="Maximum depth for directory traversal")
+    parser.add_argument('--summary', action='store_true',
+                        help="Copy project summary instead of file contents")
+    parser.add_argument('--important', action='store_true',
+                        help="Only copy important files (README, main entry points, etc.)")
+    parser.add_argument('--filter', 
+                        help="Only include files matching patterns (comma-separated, e.g., '*.py,*.js')")
+    parser.add_argument('--exclude',
+                        help="Exclude files matching patterns (comma-separated, e.g., 'test_*,*.tmp')")
+    parser.add_argument('--line-numbers', action='store_true',
+                        help="Include line numbers in source code")
+    parser.add_argument('--git-info', action='store_true',
+                        help="Include git repository information")
+    parser.add_argument('--compress-whitespace', action='store_true',
+                        help="Compress multiple blank lines to save tokens")
+    
+    args = parser.parse_args()
+    
+    if args.setup_help:
+        print_setup_help()
+        return
+    
+    # Create default ignore file if requested
+    if args.create_ignore:
+        create_default_ignore_file(args.ignore_file)
+        print(f"Created default ignore file: {args.ignore_file}")
+        return
+    
+    # Read ignore patterns
+    ignore_patterns = read_ignore_patterns(args.ignore_file)
+    if not ignore_patterns and not os.path.exists(args.ignore_file):
+        print(f"Warning: Ignore file not found: {args.ignore_file}")
+        print("Run with --create-ignore to create a default ignore file.")
+    
+    # Set up file filter function
+    def file_filter(file_path):
+        # First check if the file should be excluded
+        if args.exclude:
+            exclude_patterns = args.exclude.split(',')
+            file_name = os.path.basename(file_path)
+            for pattern in exclude_patterns:
+                if fnmatch.fnmatch(file_name, pattern.strip()):
+                    return False
+        
+        # Then check if it matches the inclusion filter
+        if args.filter:
+            include_patterns = args.filter.split(',')
+            file_name = os.path.basename(file_path)
+            for pattern in include_patterns:
+                if fnmatch.fnmatch(file_name, pattern.strip()):
+                    return True
+            return False
+        
+        return True
+    
+    # Handle tree view
+    if args.tree:
+        tree = generate_directory_tree(args.directory, ignore_patterns, args.max_depth)
+        if copy_to_clipboard(tree):
+            print(f"Copied directory tree to clipboard.")
+        else:
+            print("Failed to copy to clipboard.")
+        return
+    
+    # Handle project summary
+    if args.summary:
+        summary = get_project_summary(args.directory, ignore_patterns)
+        if copy_to_clipboard(summary):
+            print(f"Copied project summary to clipboard.")
+        else:
+            print("Failed to copy to clipboard.")
+        return
+    
+    # Determine which files to include
+    if args.important:
+        files = detect_important_files(args.directory)
+        # Filter out ignored files
+        files = [f for f in files if not should_ignore(os.path.relpath(f, args.directory), ignore_patterns)]
+    elif args.flat:
+        files = list_files_flat(args.directory, ignore_patterns, file_filter)
+    else:
+        files = list_files_recursive(args.directory, ignore_patterns, file_filter, args.max_depth)
+    
+    # Prepare output
+    output_parts = []
+    
+    # Add git info if requested
+    if args.git_info:
+        git_info = get_git_info(args.directory)
+        if args.format == 'markdown':
+            output_parts.append(f"## Git Information\n\n```\n{git_info}\n```\n\n")
+        else:
+            output_parts.append(f"--- Git Information ---\n{git_info}\n\n")
+    
+    # Copy to clipboard
+    if files:
+        if args.paths_only:
+            # Convert absolute paths to relative from the target directory
+            rel_files = [os.path.relpath(f, args.directory) for f in files]
+            file_text = '\n'.join(rel_files)
+            output_parts.append(file_text)
+            
+            # Combine all parts and copy
+            full_output = '\n'.join(output_parts)
+            if copy_to_clipboard(full_output):
+                print(f"Copied {len(files)} file paths to clipboard.")
+            else:
+                print("Failed to copy to clipboard.")
+        else:
+            # Copy file contents
+            result = get_file_contents(
+                files, 
+                args.max_size, 
+                args.format, 
+                args.line_numbers,
+                args.compress_whitespace
+            )
+            
+            output_parts.append(result['contents'])
+            
+            # Combine all parts and copy
+            full_output = '\n'.join(output_parts)
+            if copy_to_clipboard(full_output):
+                print(f"Copied contents of {len(files) - len(result['skipped']) - len(result['binary'])} files to clipboard.")
+                if result['binary']:
+                    print(f"Skipped {len(result['binary'])} binary files.")
+                if result['skipped']:
+                    print(f"Skipped {len(result['skipped'])} files exceeding size limit ({args.max_size}MB).")
+                print(f"Total characters: {result['total_chars']:,}")
+                print(f"Estimated tokens: {result['total_tokens']:,}")
+            else:
+                print("Failed to copy to clipboard.")
+    else:
+        print("No files to copy (all ignored or empty directory).")
+
+if __name__ == "__main__":
+    main()
